@@ -10,7 +10,7 @@ whimsical→画气泡和连线过于麻烦
 
 很多时候我只需要一个决策流程列出可能性将脑海中过量储备的信息关键词整理起来，方便可视化和延时做决策并在需要时可以一眼想起来之前的进度和继续完成思索。我的意图是在最少的步数以内实现它。
 
-![workflow screenshot](https://i.imgur.com/A1h31UH.png)
+![workflow screenshot](https://i.imgur.com/Zi8UyXW.png)
 
 由于考虑到将来AI越来越强，和便于其他人做一套自己的工具出来，"workflow.txt" 是耗费了蛮长时间自己慢慢琢磨出来的工程提示词
 
