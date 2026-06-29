@@ -8,12 +8,12 @@ from tkinter import font as tkfont
 
 
 class CompactFlowCanvas:
-    """单文件紧凑流程图编辑器：自由气泡、虚线箭头、自动保存、快速生长、注释悬浮、三步撤销。"""
+    """单文件紧凑流程图编辑器：自由气泡、精确/八点锚点虚线箭头、自动保存、快速生长、注释悬浮、三步撤销。"""
 
     CANVAS_BG = "#ffffff"
-    NODE_MIN_W = 54
-    NODE_MIN_H = 26
-    NODE_PAD_X = 16
+    NODE_MIN_W = 24
+    NODE_MIN_H = 24
+    NODE_PAD_X = 5
     NODE_PAD_Y = 8
     NODE_MAX_TEXT_W = 260
     NODE_RADIUS = 13
@@ -32,13 +32,14 @@ class CompactFlowCanvas:
     EDGE_SELECTED = "#1677ff"
     EDGE_DASH = (4, 3)
     EDGE_WIDTH = 2
-    EDGE_HIT_W = 14
+    EDGE_HIT_W = 10
     EDGE_PARALLEL_GAP = 7
     HANDLE_R = 5
     DRAG_START_PX = 4
     SNAP_THRESHOLD = 8
     # 5px 距离网格不要太强；越小越不容易被强制吸走。
     SNAP_DISTANCE_THRESHOLD = 1.4
+    ANCHOR_SNAP_PX = 5.0
     SNAP_GUIDE_COLOR = "#bdbdbd"
 
     AUTOSAVE_MS = 60_000
@@ -80,6 +81,8 @@ class CompactFlowCanvas:
         self.entry_window = None
         self.edit_node_id = None
         self.edit_original_text = ""
+        self.edit_original_w = self.NODE_MIN_W
+        self.edit_original_h = self.NODE_MIN_H
 
         self.note_popup_items = []
         self.note_popup_node_id = None
@@ -121,7 +124,7 @@ class CompactFlowCanvas:
         self.status = tk.Label(
             top,
             anchor="w",
-            text="空白左键=新气泡；先单击选中再拖动=移动；Ctrl+左键拖框=多选；Snap轻吸附对齐；右键拖气泡=虚线箭头；右键轻点气泡=注释。",
+            text="空白左键=新气泡；先单击选中再拖动=移动；Ctrl+左键拖框=多选；Snap轻吸附对齐；右键拖气泡=虚线箭头；右键轻点气泡=注释；点线后拖蓝端点=改连接/边缘锚点。",
         )
         self.status.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
@@ -261,6 +264,7 @@ class CompactFlowCanvas:
             font=self.font,
             tags=("node", f"node:{nid}", "node_text"),
             justify=tk.CENTER,
+            width=max(1, w - self.NODE_PAD_X * 2),
         )
 
         # 有注释的节点用 3px 红色边框直接标记，不再额外画右上角蓝色小角标。
@@ -335,12 +339,21 @@ class CompactFlowCanvas:
                     self.canvas.tag_raise(item)
 
     # ---------- 边 ----------
-    def create_edge(self, source, target):
+    def create_edge(self, source, target, target_point=None):
         if source not in self.nodes or target not in self.nodes or source == target:
             return None
         eid = self.next_edge_id
         self.next_edge_id += 1
-        self.edges[eid] = {"id": eid, "source": source, "target": target, "hit": None, "line": None}
+        source_anchor, target_anchor = self.default_edge_anchors(source, target, target_point=target_point)
+        self.edges[eid] = {
+            "id": eid,
+            "source": source,
+            "target": target,
+            "source_anchor": source_anchor,
+            "target_anchor": target_anchor,
+            "hit": None,
+            "line": None,
+        }
         self.recompute_depths()
         self.redraw_all_edges()
         self.select("edge", eid)
@@ -391,7 +404,19 @@ class CompactFlowCanvas:
             self.redraw_edge(eid)
         self.show_edge_handles_if_needed()
 
-    def edge_points(self, source_id, target_id):
+    def edge_points(self, source_id, target_id, edge=None):
+        if edge is not None:
+            s_anchor = edge.get("source_anchor")
+            t_anchor = edge.get("target_anchor")
+            if s_anchor and t_anchor:
+                s_anchor = self.normalize_anchor(s_anchor)
+                t_anchor = self.normalize_anchor(t_anchor)
+                edge["source_anchor"] = s_anchor
+                edge["target_anchor"] = t_anchor
+                sx, sy = self.anchor_to_point(source_id, s_anchor)
+                tx, ty = self.anchor_to_point(target_id, t_anchor)
+                return sx, sy, tx, ty
+
         a = self.nodes[source_id]
         b = self.nodes[target_id]
         ax, ay = a["x"] + a["w"] / 2, a["y"] + a["h"] / 2
@@ -416,6 +441,160 @@ class CompactFlowCanvas:
             scale = min(hw / abs(dx), hh / abs(dy))
         return cx + dx * scale, cy + dy * scale
 
+    def default_edge_anchors(self, source_id, target_id, target_point=None):
+        """
+        新建连线默认规则：
+        - 出发点只从出发气泡左右边的上/中/下 6 个点里选，取离目标气泡最终落点最近者。
+        - 目标点默认取用户鼠标最后落在目标气泡上的位置，并投影到目标气泡边缘。
+        - Snap辅助开启且目标点靠近八点锚点时，目标点吸附到八点锚点。
+        """
+        if target_point is None:
+            target = self.nodes[target_id]
+            tx = target["x"] + target["w"] / 2
+            ty = target["y"] + target["h"] / 2
+            snap_target = False
+        else:
+            tx, ty = target_point
+            snap_target = True
+        target_anchor = self.point_to_edge_anchor_on_node(target_id, tx, ty, snap_if_close=snap_target)
+        final_tx, final_ty = self.anchor_to_point(target_id, target_anchor)
+        source_anchor = self.default_source_anchor(source_id, final_tx, final_ty)
+        return source_anchor, target_anchor
+
+    def normalize_anchor(self, anchor):
+        if isinstance(anchor, dict):
+            side = anchor.get("side", "right")
+            if side not in {"left", "right", "top", "bottom"}:
+                side = "right"
+            try:
+                t = float(anchor.get("t", 0.5))
+            except (TypeError, ValueError):
+                t = 0.5
+            return {"side": side, "t": max(0.0, min(1.0, t))}
+        return {"side": "right", "t": 0.5}
+
+    def anchor_to_point(self, nid, anchor):
+        n = self.nodes[nid]
+        a = self.normalize_anchor(anchor)
+        side = a["side"]
+        t = a["t"]
+        x1, y1 = n["x"], n["y"]
+        x2, y2 = x1 + n["w"], y1 + n["h"]
+        if side == "left":
+            return x1, y1 + t * n["h"]
+        if side == "right":
+            return x2, y1 + t * n["h"]
+        if side == "top":
+            return x1 + t * n["w"], y1
+        return x1 + t * n["w"], y2
+
+    def anchor_candidates_for_node(self, nid):
+        """
+        每个气泡固定 8 个候选锚点：
+        左上、上中、右上、右中、右下、下中、左下、左中。
+        这些点用于 Snap 近距离吸附、快速整理和视觉参考；非吸附时仍可用精确边缘落点。
+        """
+        if nid not in self.nodes:
+            return []
+        raw = [
+            {"side": "top", "t": 0.0},
+            {"side": "top", "t": 0.5},
+            {"side": "top", "t": 1.0},
+            {"side": "right", "t": 0.5},
+            {"side": "bottom", "t": 1.0},
+            {"side": "bottom", "t": 0.5},
+            {"side": "bottom", "t": 0.0},
+            {"side": "left", "t": 0.5},
+        ]
+        out = []
+        for a in raw:
+            px, py = self.anchor_to_point(nid, a)
+            out.append((a, px, py))
+        return out
+
+    def source_anchor_candidates_for_node(self, nid):
+        """出发气泡默认只用左/右边上中下 6 点，避免箭头从顶部/底部乱出发。"""
+        if nid not in self.nodes:
+            return []
+        raw = []
+        for side in ("left", "right"):
+            for t in (0.0, 0.5, 1.0):
+                raw.append({"side": side, "t": t})
+        out = []
+        for a in raw:
+            px, py = self.anchor_to_point(nid, a)
+            out.append((a, px, py))
+        return out
+
+    def default_source_anchor(self, nid, target_x, target_y):
+        candidates = self.source_anchor_candidates_for_node(nid)
+        if not candidates:
+            return {"side": "right", "t": 0.5}
+        best, _, _ = min(candidates, key=lambda item: math.hypot(target_x - item[1], target_y - item[2]))
+        return dict(best)
+
+    def nearest_8_anchor(self, nid, x, y):
+        candidates = self.anchor_candidates_for_node(nid)
+        if not candidates:
+            return None, float("inf"), None, None
+        best, px, py = min(candidates, key=lambda item: math.hypot(x - item[1], y - item[2]))
+        return dict(best), math.hypot(x - px, y - py), px, py
+
+    def point_to_edge_anchor_on_node(self, nid, x, y, snap_if_close=False):
+        """
+        将鼠标点投影成气泡边缘上的精确锚点。
+        Snap开启时，如果离八点锚点 <=2px，就贴附到那一个八点锚点；否则保留精确边缘位置。
+        """
+        if nid not in self.nodes:
+            return {"side": "right", "t": 0.5}
+        if snap_if_close and self.snap_enabled.get():
+            best, dist, _, _ = self.nearest_8_anchor(nid, x, y)
+            if best is not None and dist <= self.ANCHOR_SNAP_PX:
+                return best
+
+        n = self.nodes[nid]
+        x1, y1 = float(n["x"]), float(n["y"])
+        x2, y2 = x1 + float(n["w"]), y1 + float(n["h"])
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        cx = min(max(float(x), x1), x2)
+        cy = min(max(float(y), y1), y2)
+
+        # 如果点在气泡内，选择距离最近的边；如果在外，选择投影后对应最近边。
+        distances = {
+            "left": abs(cx - x1),
+            "right": abs(x2 - cx),
+            "top": abs(cy - y1),
+            "bottom": abs(y2 - cy),
+        }
+        side = min(distances, key=distances.get)
+        if side in {"left", "right"}:
+            return {"side": side, "t": max(0.0, min(1.0, (cy - y1) / h))}
+        return {"side": side, "t": max(0.0, min(1.0, (cx - x1) / w))}
+
+    def point_to_anchor_on_node(self, nid, x, y):
+        # 兼容旧调用：默认返回精确边缘锚点；Snap开启且非常接近八点时才吸附。
+        return self.point_to_edge_anchor_on_node(nid, x, y, snap_if_close=True)
+
+    def snap_anchor_to_8_points(self, nid, anchor):
+        if nid not in self.nodes:
+            return self.normalize_anchor(anchor)
+        ax, ay = self.anchor_to_point(nid, anchor)
+        best, _, _, _ = self.nearest_8_anchor(nid, ax, ay)
+        return best if best is not None else self.normalize_anchor(anchor)
+
+    def anchor_almost_equal(self, a, b):
+        aa = self.normalize_anchor(a)
+        bb = self.normalize_anchor(b)
+        return aa["side"] == bb["side"] and abs(aa["t"] - bb["t"]) < 0.002
+
+    def point_near_node(self, nid, x, y, margin=18):
+        if nid not in self.nodes:
+            return False
+        n = self.nodes[nid]
+        return (n["x"] - margin <= x <= n["x"] + n["w"] + margin and
+                n["y"] - margin <= y <= n["y"] + n["h"] + margin)
+
     def edge_overlap_group(self, eid):
         if eid not in self.edges:
             return [], 0
@@ -436,7 +615,7 @@ class CompactFlowCanvas:
 
     def edge_display_points(self, eid):
         edge = self.edges[eid]
-        x1, y1, x2, y2 = self.edge_points(edge["source"], edge["target"])
+        x1, y1, x2, y2 = self.edge_points(edge["source"], edge["target"], edge=edge)
         group, index = self.edge_overlap_group(eid)
         if len(group) <= 1:
             return x1, y1, x2, y2
@@ -501,10 +680,10 @@ class CompactFlowCanvas:
         elif kind == "edge" and item_id in self.edges:
             self.redraw_edge(item_id)
             self.show_edge_handles_if_needed()
-            self.status.config(text="已选中箭头：拖蓝色端点到另一个气泡可重连；Delete 删除这条线。")
+            self.status.config(text="已选中箭头：拖蓝色端点到任意气泡边缘，可改起点/终点和具体边缘落点；Snap开启且靠近8点锚点会贴附；Delete 删除这条线。")
         else:
             self.clear_handles()
-            self.status.config(text="空白左键=新气泡；Ctrl+左键拖框=多选；先选中再拖动=移动；右键拖气泡=连虚线箭头；右键轻点=注释。")
+            self.status.config(text="空白左键=新气泡；Ctrl+左键拖框=多选；先选中再拖动=移动；右键拖气泡=连虚线箭头；右键轻点=注释；点线后拖蓝端点=改连接/边缘锚点。")
 
     def get_selected_node_ids(self):
         if self.selected_kind == "node" and self.selected_id in self.nodes:
@@ -575,20 +754,73 @@ class CompactFlowCanvas:
                 return int(eid), endpoint
         return None
 
+    def point_in_node(self, nid, x, y):
+        """严格判断点击是否真的落在气泡图形内部。
+        不再用大范围 overlap 去猜节点，避免 5px 缝隙里点线时误选相邻气泡。
+        """
+        if nid not in self.nodes:
+            return False
+        n = self.nodes[nid]
+        x1, y1 = float(n["x"]), float(n["y"])
+        x2, y2 = x1 + float(n.get("w", self.NODE_MIN_W)), y1 + float(n.get("h", self.NODE_MIN_H))
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return False
+        r = min(float(self.NODE_RADIUS), (y2 - y1) / 2.0, (x2 - x1) / 2.0)
+        # 中间矩形/横向矩形区域直接算命中。
+        if x1 + r <= x <= x2 - r:
+            return True
+        if y1 + r <= y <= y2 - r:
+            return True
+        # 四个圆角按圆形命中，角外空白不算点到气泡。
+        cx = x1 + r if x < x1 + r else x2 - r
+        cy = y1 + r if y < y1 + r else y2 - r
+        return math.hypot(x - cx, y - cy) <= r
+
+    def point_to_segment_distance(self, px, py, x1, y1, x2, y2):
+        dx, dy = x2 - x1, y2 - y1
+        length2 = dx * dx + dy * dy
+        if length2 <= 0.0001:
+            return math.hypot(px - x1, py - y1)
+        t = ((px - x1) * dx + (py - y1) * dy) / length2
+        t = max(0.0, min(1.0, t))
+        cx, cy = x1 + t * dx, y1 + t * dy
+        return math.hypot(px - cx, py - cy)
+
+    def nearest_edge_at(self, x, y, radius=None):
+        if radius is None:
+            radius = max(4.0, self.EDGE_HIT_W / 2.0)
+        best_eid = None
+        best_dist = radius + 0.001
+        for eid in list(self.edges.keys()):
+            try:
+                x1, y1, x2, y2 = self.edge_display_points(eid)
+            except Exception:
+                continue
+            d = self.point_to_segment_distance(x, y, x1, y1, x2, y2)
+            if d < best_dist:
+                best_dist = d
+                best_eid = eid
+        return best_eid
+
     def get_top_item_data(self, x, y):
+        # 端点手柄仍然需要宽一点，方便拖拽重连。
         items = self.canvas.find_overlapping(x - 7, y - 7, x + 7, y + 7)
         for item in reversed(items):
             handle = self.item_handle(item)
             if handle:
                 return "handle", handle
-        for item in reversed(items):
+
+        # 节点命中改成严格几何判断：只有明确落在气泡内部才选中气泡。
+        exact_items = self.canvas.find_overlapping(x, y, x, y)
+        for item in reversed(exact_items):
             nid = self.item_node_id(item)
-            if nid is not None and nid in self.nodes:
+            if nid is not None and nid in self.nodes and self.point_in_node(nid, x, y):
                 return "node", nid
-        for item in reversed(items):
-            eid = self.item_edge_id(item)
-            if eid is not None and eid in self.edges:
-                return "edge", eid
+
+        # 没有点中气泡时，再用线段距离命中连接线；这样 5px 或更短缝隙里也能点线删改。
+        eid = self.nearest_edge_at(x, y)
+        if eid is not None:
+            return "edge", eid
         return None, None
 
     def node_at(self, x, y):
@@ -646,8 +878,16 @@ class CompactFlowCanvas:
                 self.start_single_drag(nid, x, y)
             return
         if kind == "edge":
+            already_selected_edge = self.selected_kind == "edge" and self.selected_id == data
             self.select("edge", data)
-            self.mode = None
+            if already_selected_edge and data in self.edges:
+                x1, y1, x2, y2 = self.edge_display_points(data)
+                d_source = math.hypot(x - x1, y - y1)
+                d_target = math.hypot(x - x2, y - y2)
+                endpoint = "source" if d_source <= d_target else "target"
+                self.start_rewire(data, endpoint, x, y)
+            else:
+                self.mode = None
             return
 
         # 如果刚才只是为了结束编辑而点空白，不再顺手生成一个新的空气泡。
@@ -924,9 +1164,9 @@ class CompactFlowCanvas:
             if math.hypot(x - sx0, y - sy0) < self.DRAG_START_PX:
                 return "break"
             self.right_dragging = True
-            sx, sy = self.node_center(self.right_source_id)
+            sx, sy, ex, ey = self.preview_new_edge_points(self.right_source_id, x, y)
             self.temp_line_id = self.canvas.create_line(
-                sx, sy, x, y,
+                sx, sy, ex, ey,
                 fill=self.EDGE_COLORS[0],
                 width=self.EDGE_WIDTH,
                 arrow=tk.LAST,
@@ -934,10 +1174,10 @@ class CompactFlowCanvas:
                 dash=self.EDGE_DASH,
                 tags=("temp_line",),
             )
-            self.status.config(text="正在连线：拖到目标气泡后松开。")
+            self.status.config(text="正在连线：出发点自动选左右边上/中/下最近点；目标点按鼠标落点，Snap开启且靠近8点锚点会贴附。")
         if self.temp_line_id is not None:
-            sx, sy = self.node_center(self.right_source_id)
-            self.canvas.coords(self.temp_line_id, sx, sy, x, y)
+            sx, sy, ex, ey = self.preview_new_edge_points(self.right_source_id, x, y)
+            self.canvas.coords(self.temp_line_id, sx, sy, ex, ey)
         return "break"
 
     def on_right_up(self, event):
@@ -950,7 +1190,7 @@ class CompactFlowCanvas:
             kind, data = self.get_top_item_data(x, y)
             if kind == "node" and data != source_id:
                 self.record_undo()
-                self.create_edge(source_id, data)
+                self.create_edge(source_id, data, target_point=(x, y))
         if self.temp_line_id is not None:
             self.canvas.delete(self.temp_line_id)
         self.temp_line_id = None
@@ -976,6 +1216,21 @@ class CompactFlowCanvas:
     def node_center(self, nid):
         n = self.nodes[nid]
         return n["x"] + n["w"] / 2, n["y"] + n["h"] / 2
+
+    def preview_new_edge_points(self, source_id, x, y):
+        """右键拖拽时的临时线预览：源点按左右 6 点最近，目标点按鼠标精确落点/Snap近距离吸附。"""
+        if source_id not in self.nodes:
+            return x, y, x, y
+        kind, data = self.get_top_item_data(x, y)
+        target_nid = data if kind == "node" and data in self.nodes and data != source_id else None
+        if target_nid is not None:
+            target_anchor = self.point_to_edge_anchor_on_node(target_nid, x, y, snap_if_close=True)
+            ex, ey = self.anchor_to_point(target_nid, target_anchor)
+        else:
+            ex, ey = x, y
+        source_anchor = self.default_source_anchor(source_id, ex, ey)
+        sx, sy = self.anchor_to_point(source_id, source_anchor)
+        return sx, sy, ex, ey
 
     # ---------- 快速新建：Tab / Enter ----------
     def on_tab_key(self, event=None):
@@ -1060,14 +1315,21 @@ class CompactFlowCanvas:
             return
         edge = self.edges[eid]
         self.mode = "rewire"
-        self.rewire = {"eid": eid, "endpoint": endpoint, "old_source": edge["source"], "old_target": edge["target"]}
+        self.rewire = {
+            "eid": eid,
+            "endpoint": endpoint,
+            "old_source": edge["source"],
+            "old_target": edge["target"],
+            "old_source_anchor": edge.get("source_anchor"),
+            "old_target_anchor": edge.get("target_anchor"),
+        }
         if self.temp_line_id is not None:
             self.canvas.delete(self.temp_line_id)
         if endpoint == "source":
-            tx, ty = self.node_center(edge["target"])
+            tx, ty = self.anchor_to_point(edge["target"], edge.get("target_anchor") or self.default_edge_anchors(edge["source"], edge["target"])[1])
             coords = (x, y, tx, ty)
         else:
-            sx, sy = self.node_center(edge["source"])
+            sx, sy = self.anchor_to_point(edge["source"], edge.get("source_anchor") or self.default_edge_anchors(edge["source"], edge["target"])[0])
             coords = (sx, sy, x, y)
         self.temp_line_id = self.canvas.create_line(
             *coords,
@@ -1079,16 +1341,17 @@ class CompactFlowCanvas:
             tags=("temp_line",),
         )
         self.clear_handles()
+        self.status.config(text="正在重连/调锚点：拖到目标气泡边缘后松开；落点默认是精确边缘位置；Snap开启且靠近8点锚点会贴附。")
 
     def update_rewire_temp(self, x, y):
         if not self.rewire or self.temp_line_id is None:
             return
         edge = self.edges[self.rewire["eid"]]
         if self.rewire["endpoint"] == "source":
-            tx, ty = self.node_center(edge["target"])
+            tx, ty = self.anchor_to_point(edge["target"], edge.get("target_anchor") or self.default_edge_anchors(edge["source"], edge["target"])[1])
             self.canvas.coords(self.temp_line_id, x, y, tx, ty)
         else:
-            sx, sy = self.node_center(edge["source"])
+            sx, sy = self.anchor_to_point(edge["source"], edge.get("source_anchor") or self.default_edge_anchors(edge["source"], edge["target"])[0])
             self.canvas.coords(self.temp_line_id, sx, sy, x, y)
 
     def finish_rewire(self, x, y):
@@ -1097,17 +1360,30 @@ class CompactFlowCanvas:
         eid = self.rewire["eid"]
         endpoint = self.rewire["endpoint"]
         kind, data = self.get_top_item_data(x, y)
-        changed = False
-        if eid in self.edges and kind == "node":
+        if eid in self.edges:
             edge = self.edges[eid]
-            if endpoint == "source" and data != edge["target"] and data != edge["source"]:
-                self.record_undo()
-                edge["source"] = data
-                changed = True
-            elif endpoint == "target" and data != edge["source"] and data != edge["target"]:
-                self.record_undo()
-                edge["target"] = data
-                changed = True
+            current_nid = edge["source"] if endpoint == "source" else edge["target"]
+            other_nid = edge["target"] if endpoint == "source" else edge["source"]
+            target_nid = data if kind == "node" else None
+            # 允许在当前气泡边缘附近松开，用来只改变“接到气泡哪个位置”。
+            if target_nid is None and self.point_near_node(current_nid, x, y, margin=20):
+                target_nid = current_nid
+            if target_nid in self.nodes and target_nid != other_nid:
+                new_anchor = self.point_to_edge_anchor_on_node(target_nid, x, y, snap_if_close=True)
+                if endpoint == "source":
+                    changed = (edge["source"] != target_nid or
+                               not self.anchor_almost_equal(edge.get("source_anchor"), new_anchor))
+                    if changed:
+                        self.record_undo()
+                        edge["source"] = target_nid
+                        edge["source_anchor"] = new_anchor
+                else:
+                    changed = (edge["target"] != target_nid or
+                               not self.anchor_almost_equal(edge.get("target_anchor"), new_anchor))
+                    if changed:
+                        self.record_undo()
+                        edge["target"] = target_nid
+                        edge["target_anchor"] = new_anchor
         if self.temp_line_id is not None:
             self.canvas.delete(self.temp_line_id)
             self.temp_line_id = None
@@ -1127,29 +1403,80 @@ class CompactFlowCanvas:
         self.edit_original_text = self.nodes[nid].get("text", "")
         self.edit_undo_snapshot = self.current_data_snapshot()
         node = self.nodes[nid]
+        self.edit_original_w = node.get("w", self.NODE_MIN_W)
+        self.edit_original_h = node.get("h", self.NODE_MIN_H)
 
-        self.entry = tk.Entry(self.canvas, font=self.font, relief=tk.FLAT, justify=tk.LEFT)
-        self.entry.insert(0, node.get("text", ""))
+        # 用 Text 而不是 Entry：支持 Shift+Enter 换行；普通 Enter 仍然用于向下生成新气泡。
+        self.entry = tk.Text(
+            self.canvas,
+            font=self.font,
+            relief=tk.FLAT,
+            bd=0,
+            padx=0,
+            pady=0,
+            wrap=tk.CHAR,
+            undo=False,
+            highlightthickness=0,
+        )
+        self.entry.insert("1.0", node.get("text", ""))
         if select_all:
-            self.entry.selection_range(0, tk.END)
+            self.entry.tag_add("sel", "1.0", "end-1c")
         self.entry_window = self.canvas.create_window(
-            node["x"] + self.NODE_PAD_X * 0.65,
-            node["y"] + max(3, (node["h"] - 20) / 2),
+            node["x"] + self.NODE_PAD_X,
+            node["y"] + max(2, self.NODE_PAD_Y / 2),
             anchor="nw",
             window=self.entry,
-            width=max(40, node["w"] - self.NODE_PAD_X * 1.3),
-            height=20,
+            width=max(20, node["w"] - self.NODE_PAD_X * 2),
+            height=max(18, node["h"] - self.NODE_PAD_Y),
         )
         self.entry.focus_set()
         self.entry.bind("<Tab>", lambda e: self.spawn_from_edit("right"))
         self.entry.bind("<Return>", lambda e: self.spawn_from_edit("down"))
         self.entry.bind("<KP_Enter>", lambda e: self.spawn_from_edit("down"))
+        self.entry.bind("<Shift-Return>", self.insert_edit_newline)
+        self.entry.bind("<Shift-KP_Enter>", self.insert_edit_newline)
         self.entry.bind("<Escape>", lambda e: self.cancel_edit())
         self.entry.bind("<Control-z>", self.undo_last)
         self.entry.bind("<Control-Z>", self.undo_last)
         self.entry.bind("<FocusOut>", lambda e: self.commit_edit_if_active())
         self.entry.bind("<KeyRelease>", self.live_resize_editing_node)
-        self.status.config(text="正在输入：Tab 在右侧10px生成新气泡；Enter 在下方10px生成新气泡；Esc 撤销；空内容会自动删除。")
+        self.status.config(text="正在输入：Shift+Enter 换行；Tab 在右侧10px生成新气泡；Enter 在下方10px生成新气泡；Esc 撤销；空内容会自动删除。")
+
+    def get_edit_text(self):
+        if self.entry is None:
+            return ""
+        try:
+            return self.entry.get("1.0", "end-1c")
+        except TypeError:
+            return self.entry.get()
+        except tk.TclError:
+            return ""
+
+    def insert_edit_newline(self, event=None):
+        if self.entry is None:
+            return "break"
+        try:
+            self.entry.insert(tk.INSERT, "\n")
+        except tk.TclError:
+            return "break"
+        self.root.after_idle(self.live_resize_editing_node)
+        return "break"
+
+    def update_edit_widget_geometry(self, nid):
+        if self.entry_window is None or nid not in self.nodes:
+            return
+        node = self.nodes[nid]
+        self.canvas.coords(
+            self.entry_window,
+            node["x"] + self.NODE_PAD_X,
+            node["y"] + max(2, self.NODE_PAD_Y / 2),
+        )
+        self.canvas.itemconfigure(
+            self.entry_window,
+            width=max(20, node["w"] - self.NODE_PAD_X * 2),
+            height=max(18, node["h"] - self.NODE_PAD_Y),
+        )
+        self.canvas.tag_raise(self.entry_window)
 
     def live_resize_editing_node(self, event=None):
         if self.entry is None or self.edit_node_id not in self.nodes:
@@ -1157,23 +1484,77 @@ class CompactFlowCanvas:
         if event is not None and event.keysym in {"Tab", "Return", "KP_Enter", "Escape"}:
             return
         nid = self.edit_node_id
-        self.nodes[nid]["text"] = self.entry.get()
-        # 关键：node['x'] 不变，所以文字增长只会把气泡向右侧推开。
+        self.nodes[nid]["text"] = self.get_edit_text()
+        # 关键：node['x'] 不变，所以文字增长只会把气泡向右侧延展；换行只会向下延展。
         self.redraw_node(nid)
         self.redraw_edges_for_node(nid)
+        self.update_edit_widget_geometry(nid)
+
+    def auto_reflow_after_node_resize(self, nid, old_w, old_h):
+        """Snap开启时，编辑导致气泡变大后，轻量推开右侧/下方气泡，保持约 5px 间隔。"""
+        if not self.snap_enabled.get() or nid not in self.nodes:
+            return
         node = self.nodes[nid]
-        if self.entry_window is not None:
-            self.canvas.coords(self.entry_window, node["x"] + self.NODE_PAD_X * 0.65, node["y"] + max(3, (node["h"] - 20) / 2))
-            self.canvas.itemconfigure(self.entry_window, width=max(40, node["w"] - self.NODE_PAD_X * 1.3), height=20)
-            self.canvas.tag_raise(self.entry_window)
+        new_w = float(node.get("w", old_w))
+        new_h = float(node.get("h", old_h))
+        dx = max(0.0, new_w - float(old_w))
+        dy = max(0.0, new_h - float(old_h))
+        if dx <= 0.001 and dy <= 0.001:
+            return
+
+        x = float(node["x"])
+        y = float(node["y"])
+        old_right = x + float(old_w)
+        old_bottom = y + float(old_h)
+        new_right = x + new_w
+        new_bottom = y + new_h
+        old_y1, old_y2 = y, y + float(old_h)
+        old_x1, old_x2 = x, x + float(old_w)
+        gap = 5.0
+        moved = set()
+
+        def ranges_overlap(a1, a2, b1, b2, pad=6.0):
+            return not (a2 + pad < b1 or b2 + pad < a1)
+
+        if dx > 0.001:
+            # 原本就在右侧同一行/相交行的气泡，整体向右推，保留原有横向间隔。
+            for oid, other in self.nodes.items():
+                if oid == nid:
+                    continue
+                ox = float(other["x"])
+                oy1 = float(other["y"])
+                oy2 = oy1 + float(other.get("h", self.NODE_MIN_H))
+                if ox >= old_right + gap - self.SNAP_THRESHOLD and ranges_overlap(old_y1, old_y2, oy1, oy2):
+                    other["x"] = max(ox + dx, new_right + gap)
+                    moved.add(oid)
+
+        if dy > 0.001:
+            # 原本就在下方同一列/相交列的气泡，整体向下推，保留原有纵向间隔。
+            for oid, other in self.nodes.items():
+                if oid == nid:
+                    continue
+                oy = float(other["y"])
+                ox1 = float(other["x"])
+                ox2 = ox1 + float(other.get("w", self.NODE_MIN_W))
+                if oy >= old_bottom + gap - self.SNAP_THRESHOLD and ranges_overlap(old_x1, old_x2, ox1, ox2):
+                    other["y"] = max(oy + dy, new_bottom + gap)
+                    moved.add(oid)
+
+        if moved:
+            for moved_id in moved:
+                self.redraw_node(moved_id)
+                self.redraw_edges_for_node(moved_id)
+            self.redraw_edges_for_node(nid)
 
     def commit_edit_if_active(self):
         if self.entry is None:
             return
         nid = self.edit_node_id
-        text = self.entry.get()
+        text = self.get_edit_text()
         original_text = self.edit_original_text
         undo_snapshot = self.edit_undo_snapshot
+        old_w = self.edit_original_w
+        old_h = self.edit_original_h
         if nid in self.nodes and text != original_text:
             self.record_undo_snapshot(undo_snapshot)
             self.nodes[nid]["text"] = text
@@ -1184,6 +1565,8 @@ class CompactFlowCanvas:
         self.entry_window = None
         self.edit_node_id = None
         self.edit_undo_snapshot = None
+        self.edit_original_w = self.NODE_MIN_W
+        self.edit_original_h = self.NODE_MIN_H
         try:
             entry.destroy()
         except tk.TclError:
@@ -1200,8 +1583,9 @@ class CompactFlowCanvas:
             return
         if nid in self.nodes:
             self.redraw_node(nid)
+            self.auto_reflow_after_node_resize(nid, old_w, old_h)
             self.redraw_edges_for_node(nid)
-        self.status.config(text="输入完成。Tab/Enter 可继续快速生成气泡；右键拖气泡可连虚线箭头。")
+        self.status.config(text="输入完成。Snap开启时会把右侧/下方气泡轻量推开保持5px；Tab/Enter 可继续快速生成气泡。")
 
     def cancel_edit(self):
         if self.entry is None:
@@ -1215,6 +1599,8 @@ class CompactFlowCanvas:
         self.entry_window = None
         self.edit_node_id = None
         self.edit_undo_snapshot = None
+        self.edit_original_w = self.NODE_MIN_W
+        self.edit_original_h = self.NODE_MIN_H
         try:
             entry.destroy()
         except tk.TclError:
@@ -1669,7 +2055,7 @@ class CompactFlowCanvas:
     def undo_last(self, event=None):
         # 正在编辑时，Ctrl+Z 优先回到进入编辑前的状态，不需要先提交。
         if self.entry is not None and self.edit_undo_snapshot is not None:
-            current_text = self.entry.get()
+            current_text = self.get_edit_text()
             if current_text != self.edit_original_text:
                 target_key = json.dumps(self.edit_undo_snapshot, ensure_ascii=False, sort_keys=True)
                 if self.undo_stack:
@@ -1722,6 +2108,8 @@ class CompactFlowCanvas:
         self.entry_window = None
         self.edit_node_id = None
         self.edit_original_text = ""
+        self.edit_original_w = self.NODE_MIN_W
+        self.edit_original_h = self.NODE_MIN_H
         self.edit_undo_snapshot = None
 
     def apply_data_snapshot(self, data):
@@ -1799,7 +2187,19 @@ class CompactFlowCanvas:
                 t = int(item["target"])
                 if s in self.nodes and t in self.nodes and s != t:
                     max_eid = max(max_eid, eid)
-                    self.edges[eid] = {"id": eid, "source": s, "target": t, "hit": None, "line": None}
+                    source_anchor = item.get("source_anchor")
+                    target_anchor = item.get("target_anchor")
+                    if not source_anchor or not target_anchor:
+                        source_anchor, target_anchor = self.default_edge_anchors(s, t)
+                    self.edges[eid] = {
+                        "id": eid,
+                        "source": s,
+                        "target": t,
+                        "source_anchor": self.normalize_anchor(source_anchor),
+                        "target_anchor": self.normalize_anchor(target_anchor),
+                        "hit": None,
+                        "line": None,
+                    }
 
             self.next_node_id = max_nid + 1
             self.next_edge_id = max_eid + 1
@@ -1813,7 +2213,7 @@ class CompactFlowCanvas:
         active_text = None
         active_nid = self.edit_node_id if self.entry is not None else None
         if self.entry is not None and active_nid in self.nodes:
-            active_text = self.entry.get()
+            active_text = self.get_edit_text()
 
         active_note_nid = None
         active_note = None
@@ -1854,10 +2254,16 @@ class CompactFlowCanvas:
         edges_data = []
         for eid, e in self.edges.items():
             if e["source"] in valid_nodes and e["target"] in valid_nodes and e["source"] != e["target"]:
-                edges_data.append({"id": eid, "source": e["source"], "target": e["target"]})
+                edges_data.append({
+                    "id": eid,
+                    "source": e["source"],
+                    "target": e["target"],
+                    "source_anchor": self.normalize_anchor(e.get("source_anchor")),
+                    "target_anchor": self.normalize_anchor(e.get("target_anchor")),
+                })
 
         return {
-            "version": 7,
+            "version": 8,
             "coordinates": "left_top",
             "nodes": nodes_data,
             "edges": edges_data,
@@ -1979,7 +2385,19 @@ class CompactFlowCanvas:
             t = int(item["target"])
             if s in self.nodes and t in self.nodes and s != t:
                 max_eid = max(max_eid, eid)
-                self.edges[eid] = {"id": eid, "source": s, "target": t, "hit": None, "line": None}
+                source_anchor = item.get("source_anchor")
+                target_anchor = item.get("target_anchor")
+                if not source_anchor or not target_anchor:
+                    source_anchor, target_anchor = self.default_edge_anchors(s, t)
+                self.edges[eid] = {
+                    "id": eid,
+                    "source": s,
+                    "target": t,
+                    "source_anchor": self.normalize_anchor(source_anchor),
+                    "target_anchor": self.normalize_anchor(target_anchor),
+                    "hit": None,
+                    "line": None,
+                }
 
         self.next_node_id = max_nid + 1
         self.next_edge_id = max_eid + 1
