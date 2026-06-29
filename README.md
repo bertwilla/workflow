@@ -12,5 +12,4 @@ whimsical→画气泡和连线过于麻烦
 
 由于考虑到将来AI越来越强，和便于其他人做一套自己的工具出来，"workflow.txt" 是耗费了蛮长时间自己慢慢琢磨出来的工程提示词
 
-最后我要无缘无故突然哈气所有人，哈！！！
  ![workflow screenshot](https://i.imgur.com/yOa5EGl.jpeg)
